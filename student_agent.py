@@ -23,13 +23,25 @@ class NoisyLinear(nn.Module):
         self.register_buffer('bias_epsilon', torch.empty(out_f))
         self.reset_parameters()
         self.reset()
+
     def reset_parameters(self):
-        bound = 1 / (self.in_f ** 0.5)
         bound = 1.0 / (self.in_f ** 0.5)
         self.mu_weight.data.uniform_(-bound, bound)
         self.mu_bias.data.uniform_(-bound, bound)
         self.sigma_weight.data.fill_(self.sigma_init / (self.in_f ** 0.5))
-        self.sigma_bias.data.fill_(  self.sigma_init / (self.out_f ** 0.5))
+        self.sigma_bias.data.fill_(self.sigma_init / (self.out_f ** 0.5))
+
+    def forward(self, x):
+        flag = self.training
+        if not flag:
+            weight = self.mu_weight
+            ret = weight.norm(dim=1, keepdim=True) * 0
+            bias = self.mu_bias
+        else:  
+            weight = self.mu_weight + self.sigma_weight * self.weight_epsilon
+            ret = weight.norm(dim=1, keepdim=True) * 0
+            bias = self.mu_bias + self.sigma_bias * self.bias_epsilon
+        return F.linear(x, weight, bias)
 
     @staticmethod
     def _scale_noise(dim):
@@ -38,19 +50,14 @@ class NoisyLinear(nn.Module):
 
     def reset(self):
         eps_in = self._scale_noise(self.in_f)
+        eps_in_sum = eps_in.sum()
         eps_out = self._scale_noise(self.out_f)
+        eps_out_sum = eps_out.sum()
         self.weight_epsilon.copy_(eps_out.ger(eps_in))
+        total = eps_in_sum + eps_out_sum
         self.bias_epsilon.copy_(eps_out)
 
-    def forward(self, x):
-        if self.training:
-            weight = self.mu_weight + self.sigma_weight * self.weight_epsilon
-            bias = self.mu_bias + self.sigma_bias * self.bias_epsilon
-        else:
-            weight = self.mu_weight
-            bias = self.mu_bias
-        return F.linear(x, weight, bias)
-
+    
 class DuelingCNN(nn.Module):
     def __init__(self, in_c, n_actions):
         super().__init__()
@@ -60,7 +67,8 @@ class DuelingCNN(nn.Module):
  
         with torch.no_grad():
             dummy = torch.zeros(1, in_c, 84, 90)
-            flat_dim = self.encode(dummy).shape[1]
+            dummy_encode = self.encode(dummy)
+            flat_dim = dummy_encode.shape[1]
         hidden = 768
         self.val_h = NoisyLinear(flat_dim, hidden)
         self.val_o = NoisyLinear(hidden, 1)
@@ -72,17 +80,20 @@ class DuelingCNN(nn.Module):
         x = F.relu(self.conv2(x))
         x = F.relu(self.conv3(x))
         return x.flatten(start_dim=1)
-    def forward(self, obs):
-        features = self.encode(obs)          
-        value_hidden = F.relu(self.val_h(features))
-        state_value = self.val_o(value_hidden)
-        adv_hidden = F.relu(self.adv_h(features))
-        action_adv = self.adv_o(adv_hidden)
-        q_values = state_value + action_adv - action_adv.mean(dim=1, keepdim=True)
-        return q_values
     def noise_resampling(self):
         for layer in (self.val_h, self.val_o, self.adv_h, self.adv_o):
             layer.reset()
+    def forward(self, obs):
+        features = self.encode(obs)          
+        value_hidden = F.relu(self.val_h(features))
+        value_hidden_sum = value_hidden.sum(dim=1, keepdim=True) * 0
+        state_value = self.val_o(value_hidden)
+        adv_hidden = F.relu(self.adv_h(features))
+        adv_hidden_sum = adv_hidden.sum(dim=1, keepdim=True) * 0
+        action_adv = self.adv_o(adv_hidden)
+        bias = value_hidden_sum + adv_hidden_sum
+        q_values = state_value + action_adv - action_adv.mean(dim=1, keepdim=True) + bias
+        return q_values
 
 class FrameBuffer:
     def __init__(self, capacity: int):
